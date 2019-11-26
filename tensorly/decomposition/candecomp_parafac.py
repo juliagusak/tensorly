@@ -1,5 +1,6 @@
 import numpy as np
 import warnings
+import copy
 
 import tensorly as tl
 from ..random import check_random_state
@@ -461,10 +462,13 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                       tol = None, random_state = None,\
                       qmodes = None,\
                       warmup_iters = 0,\
-                      quantize_every = 1,\
+                      freeze_every = 1,\
                       qscheme = None, dtype = None,\
-                      dim = None, return_scale_zeropoint = False,\
+                      dim = None,\
                       verbose=0,\
+                      return_scale_zeropoint = False,\
+                      return_rec_errors = False,\
+                      return_qrec_errors = False,\
                       stop_criterion = 'rec_error_decrease'
                      ):
     """Modified version of tensorly.decomposition.parafac
@@ -501,8 +505,8 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
     warmup_iters : int
         Number of first ALS iterations when approximated factors are not quantized 
     
-    quantize_every : int
-        Quantize factors corresponding to modes from `qmodes` every `quantize_every` iters
+    freeze_every : int
+        Factors corresponding to modes from `qmodes` are freezed every `freeze_every` iters
 
     qscheme : quantization scheme, default is torch.per_tensor_affine
         If qscheme is not None, a factor is quantized at the end of ALS iteration.
@@ -547,53 +551,80 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
             dtype = torch.qint8
     else:
         qmodes = []
-
+        
+    ndim = tl.ndim(tensor)
     factors = initialize_factors(tensor, rank,\
                                  init = init, svd = svd,\
                                  random_state = random_state,
                                  normalize_factors=normalize_factors)
     weights = tl.ones(rank, **tl.context(tensor))
+    
+    ## Initialize quantized factors
+    qfactors = copy.deepcopy(factors)
 
     ## Scales and zero_points for quantization
-    factors_scale = [None]*len(factors)
-    factors_zeropoint= [None]*len(factors)
+    if return_scale_zeropoint:
+        factors_scale = [None]*ndim
+        factors_zeropoint= [None]*ndim
+    
+    for i, factor in enumerate(factors):
+        if i in qmodes:
+            qfactor, scale, zero_point = quantize_qint(factor,\
+                                                      dtype, qscheme,\
+                                                      dim = dim,\
+                                                      return_scale_zeropoint = True)
+            if return_scale_zeropoint:
+                factors_scale[i] = scale
+                factors_zeropoint[i] = zero_point
+                
+            qfactors[i] = qfactor
+
 
     rec_errors = []
-    original_tensor_norm = float(tl.norm(tensor, 2))
+    qrec_errors = []
+    norm_tensor = float(tl.norm(tensor, 2))
+    
+    rec_error_flag = return_rec_errors or stop_criterion.startswith('rec')
+    qrec_error_flag = return_qrec_errors or stop_criterion.startswith('qrec')
 
     if verbose:
-        print("In parafac original_tensor_norm = {}".format(original_tensor_norm))
-
+        print("In parafac norm_tensor = {}".format(norm_tensor))
 
     with torch.no_grad():
         for iteration in range(n_iter_max):
             
-            ## Freeze some quantized modes for current iter
+            ## Freeze (do not update) some modes for current iter
             frozen_modes = []
-            if iteration >= warmup_iters:
+            qflag = (iteration >= warmup_iters)
+
+            if qflag:
                 for mode in qmodes:
-                    if (iteration - warmup_iters) % quantize_every != 0:
+                    if (iteration - warmup_iters) % freeze_every != 0:
                         frozen_modes.append(mode)
             
-            for mode in range(tl.ndim(tensor)):
-
-                ## If factor `factors[mode]` should be found in quantized format,
-                ## approximate, quantize and update it every `quantized_every` iters,
-                ## stariting from `mode` iter.
-                ## Otherwise, if `factors[mode]` should be found in float format,
-                ## approximate and update it every iter.
+            for mode in range(ndim):
                 if mode in frozen_modes:
                     continue
+                    
+                ## Set factors, which are represented in quantized format when factor `mode` is approximated. All other factors are used in float format.
+                qi = [(mode + 1) % ndim]
 
                 ## Approximate the factor and update weights
                 pseudo_inverse = tl.tensor(np.ones((rank, rank), dtype = np.float32),
                                           **tl.context(tensor))
+                
+                ## Compute factor approximation
                 for i,factor in enumerate(factors):
                     if i != mode:
+                        if qflag and (i in qi):
+                            factor = qfactors[i]
+                            
                         pseudo_inverse = pseudo_inverse * tl.dot(
                             tl.transpose(factor), factor)
-
-                mttkrp = unfolding_dot_khatri_rao(tensor, (None, factors), mode)
+                        
+                mttkrp = unfolding_dot_khatri_rao(tensor,\
+                                                  (None, list(map(lambda i : qfactors[i] if qflag and (i in qi) else factors[i], range(ndim)))\
+                                                  ), mode)
 
                 factor = tl.transpose(
                     tl.solve(tl.transpose(pseudo_inverse),
@@ -601,6 +632,7 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                     )
                     )
 
+                ## Update weights
                 if normalize_factors:
                     weights = tl.norm(factor, order=2, axis=0)
                     weights = tl.where(tl.abs(weights) <= tl.eps(tensor.dtype),
@@ -608,37 +640,66 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                                        weights)
                     factor = factor/(tl.reshape(weights, (1, -1)))
 
-                ## Quantize the factor
-                if (iteration >= warmup_iters) and (mode in qmodes):
-                    if return_scale_zeropoint:
-                        factor, scale, zero_point = quantize_qint(factor,\
+                ## Update the factor
+                factors[mode] = factor   
+                 
+                ## Quantize float factor and update quantized factor
+                if qflag:
+                    if mode in qmodes:
+                        qfactor, scale, zero_point = quantize_qint(factor,\
                                                                   dtype, qscheme,\
                                                                   dim = dim,\
-                                                                  return_scale_zeropoint = True)
-                        factors_scale[mode] = scale
-                        factors_zeropoint[mode] = zero_point
+                                                                 return_scale_zeropoint = True)
+                        if return_scale_zeropoint:
+                            factors_scale[mode] = scale
+                            factors_zeropoint[mode] = zero_point
+
+                        qfactors[mode] = qfactor
                     else:
-                        factor = quantize_qint(factor, dtype, qscheme, dim = dim)
+                        qfactors[mode] = factor
+                    
 
-                ## Update the factor
-                factors[mode] = factor
+            
+            if rec_error_flag:
+                # ||tensor - rec||^2 = ||tensor||^2 + ||rec||^2 - 2*<tensor, rec>
+                factors_norm = kruskal_norm((weights, factors))
 
-            if tol:
-                unnorml_rec_error = float(tl.norm(tensor - tl.kruskal_to_tensor((weights, factors)), 2))            
-                rec_error = unnorml_rec_error / original_tensor_norm
+                # mttkrp and factor for the last mode. This is equivalent to the
+                # inner product <tensor, factorization>
+                iprod = tl.sum(tl.sum(mttkrp*factor, axis=0)*weights)
+                unnorml_rec_error = tl.sqrt(tl.abs(norm_tensor**2 + factors_norm**2 - 2*iprod))
+
+#                 unnorml_rec_error = float(tl.norm(tensor - tl.kruskal_to_tensor((weights, factors)), 2))            
+                rec_error = unnorml_rec_error / norm_tensor
                 rec_errors.append(rec_error)
-                
 
-                if iteration >= 1:
+            if qrec_error_flag:
+                qunnorml_rec_error = float(tl.norm(tensor - tl.kruskal_to_tensor((weights, qfactors)), 2))
+                qrec_error = qunnorml_rec_error / norm_tensor
+                qrec_errors.append(qrec_error)
+
+            if iteration >= 1:
+                if rec_error_flag:
                     rec_error_decrease = rec_errors[-2] - rec_errors[-1]
 
-                    if verbose and iteration % 500 == 0:
-                        print("iteration {},  reconstraction error: {}, decrease = {}, unnormalized = {}".format(iteration, rec_error, rec_error_decrease, unnorml_rec_error))
-    
+                    if verbose and iteration % 100 == 0:
+                        print("iteration {}, float factors reconstraction error: {}, decrease = {}, unnormalized = {}".format(iteration, rec_error, rec_error_decrease, unnorml_rec_error))
+
+                if qrec_error_flag:
+                    qrec_error_decrease = qrec_errors[-2] - qrec_errors[-1]
+
+                    if verbose and iteration % 100 == 0:
+                        print("iteration {}, quantized factors reconstraction error: {}, decrease = {}, unnormalized = {}".format(iteration, qrec_error, qrec_error_decrease, qunnorml_rec_error))
+
+                if tol:
                     if stop_criterion == 'rec_error_deviation':
                         stop_flag = abs(rec_error_decrease) < tol
                     elif stop_criterion == 'rec_error_decrease':
                         stop_flag =  rec_error_decrease < tol
+                    elif stop_criterion == 'qrec_error_deviation':
+                        stop_flag = abs(qrec_error_decrease) < tol
+                    elif stop_criterion == 'qrec_error_decrease':
+                        stop_flag =  qrec_error_decrease < tol
                     else:
                         raise TypeError("Unknown stop criterion")
 
@@ -646,8 +707,18 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                         if verbose:
                             print("parafac has stopped after iteration {}".format(iteration))
                         break
-
+            else:
+                if verbose:
+                    if rec_error_flag:
+                        print('float factors reconstruction error={}'.format(rec_errors[-1]))
+                    if qrec_error_flag:
+                        print('quantized factors reconstruction error={}'.format(qrec_errors[-1]))
+                            
+                            
+    kruskal_tensor = KruskalTensor((weights, factors))
+    qkruskal_tensor = KruskalTensor((weights, qfactors))
+                            
     if return_scale_zeropoint:
-        return (tuple(factors), weights), tuple(rec_errors), tuple(factors_scale), tuple(factors_zeropoint)
+        return (kruskal_tensor, qkruskal_tensor), (tuple(rec_errors), tuple(qrec_errors)), tuple(factors_scale), tuple(factors_zeropoint)
     else:
-        return (tuple(factors), weights), tuple(rec_errors)
+        return (kruskal_tensor, qkruskal_tensor), (tuple(rec_errors), tuple(qrec_errors))
