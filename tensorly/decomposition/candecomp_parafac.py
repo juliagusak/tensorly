@@ -597,10 +597,10 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
             frozen_modes = []
             qflag = (iteration >= warmup_iters)
 
-            if qflag:
-                for mode in qmodes:
-                    if (iteration - warmup_iters) % freeze_every != 0:
-                        frozen_modes.append(mode)
+#             if qflag:
+#                 for mode in qmodes:
+#                     if (iteration - warmup_iters) % freeze_every != 0:
+#                         frozen_modes.append(mode)
             
             for mode in range(ndim):
                 if mode in frozen_modes:
