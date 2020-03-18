@@ -84,13 +84,27 @@ def get_scale_zeropoint(tensor,\
   
     if qscheme in [torch.per_channel_affine, torch.per_channel_symmetric]:
         
-        tmax, tmin, zero_point = get_per_channel_stats(tensor, mode = dim)
-        zero_point = zero_point.int()
+        tmax, tmin, tmean = get_per_channel_stats(tensor, mode = dim)
+        
+        if qscheme == torch.per_channel_symmetric:
+            zero_point = tmean.round()
+        else:
+            zero_point = tl.where(tmin < 0, tmin, tl.zeros(tmin.shape)).floor()
+            tmin = tl.where(tmin < zero_point, tmin, zero_point)
+            
+        zero_point = zero_point.int()    
 
     elif qscheme in [torch.per_tensor_affine, torch.per_tensor_symmetric]:
         tmax = tensor.max()
         tmin = tensor.min() 
-        zero_point = tensor.mean().int()
+        
+        if qscheme == torch.per_tensor_symmetric:
+            zero_point = tensor.mean().round()
+        else:
+            zero_point = min(tmin, 0).floor().int()
+            tmin = min(tmin, zero_point)
+            
+        zero_point = zero_point.int()
         
     else:
         raise TypeError("Can't perform quantization. Unknown quantization scheme: {}".format(qscheme))
