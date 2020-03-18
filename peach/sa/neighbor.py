@@ -19,7 +19,7 @@ from numpy import array, reshape, vectorize
 from numpy.random import uniform, standard_normal
 from numpy import zeros, ones, arange
 from numpy import tile
-from numpy import random
+import numpy.random
 
 from random import randrange
 import types
@@ -274,8 +274,8 @@ class InvertBitsNeighbor(BinaryNeighbor):
         return xn
 
 
-################################################################################
-class MaskedInvertBitsNeighbor(BinaryNeighbor):
+##########################################################################
+class MaskedBitsNeighbor(BinaryNeighbor):
     '''
     A neighborhood based on the change of a few bits in positions
     defined by a mask.
@@ -295,18 +295,44 @@ class MaskedInvertBitsNeighbor(BinaryNeighbor):
             The length of the argument to the __call__ method
             must be  divisible by the length of the mask.
           nb
-            The number of bits to be randomly choosen to be inverted in the
-            calculation of the neighbor. Be very careful while choosing this
-            parameter. While very large optimizations can benefit from a big
-            value here, it is not recommended that more than one bit per
-            variable is inverted at each step -- otherwise, the neighbor might
+            The number of bits to be randomly choosen to be inverted
+            in the calculation of the neighbor. Be very careful while
+            choosing this parameter. While very large optimizations
+            can benefit from a big value here, it is not recommended
+            that more than one bit per variable is inverted at each
+            step -- otherwise, the neighbor might
             fall very far from the present estimate, which can make the
             algorithm not work accordingly. This defaults to 2, that is,
             at each step, only one bit will be inverted at most.
+          nsign
+            The number of sign changes made when calculating a
+            neighbor. Sign change for integers consists of flipping
+            all the bits
         '''
         self.__nb = nb
         self.__bitmask = array(mask, dtype='bool')
-        self.__allowed_positions = None
+        self.__allowed_bits = None
+
+    def _flip_bits(self, x):
+        """
+        Inverts self.__nb bits of the input bitarray
+        """
+        xn = x[:]
+        # cache the mask
+        if self.__allowed_bits is None:
+            assert(len(xn) % len(self.__bitmask) == 0)
+            data_length = len(xn)
+            num_elems = data_length // len(self.__bitmask)
+
+            self.__allowed_bits = arange(
+                data_length)[tile(self.__bitmask, num_elems)]
+
+        # invert some bits
+        indices = numpy.random.choice(self.__allowed_bits, self.__nb)
+        for index in indices:
+            xn[index] = 1 - xn[index]
+
+        return xn
 
     def __call__(self, x):
         '''
@@ -319,37 +345,88 @@ class MaskedInvertBitsNeighbor(BinaryNeighbor):
             after the first call; otherwise, unspecified behaviour
             will happen.
         '''
-        xn = x[:]
-        # cache the mask
-        if self.__allowed_positions is None:
-            assert(len(xn) % len(self.__bitmask) == 0)
-            data_length = len(xn)
-            num_pos = data_length // len(self.__bitmask)
-
-            self.__allowed_positions = arange(
-                data_length)[tile(self.__bitmask, num_pos)]
-
-        indices = random.choice(self.__allowed_positions, self.__nb)
-        for index in indices:
-            xn[index] = 1 - xn[index]
-        return xn
+        return self._flip_bits(x)
 
 
-def Int8LEBitsNeighbor(MaskedInvertBitsNeighbor):
+# alias as this class is suitable for changing unsigned integers
+UintBitsNeighbor = MaskedBitsNeighbor
 
-    """
-    Neighbor which changes ``n_least_bits`` least significant bits
-    in the int8 number. ``change_sign`` also specifies if the sign
-    of the number can be changed as well.
-    """
-    def __init__(self, n_least_bits=2, change_sign=True, nb=2):
-        mask = zeros(8, dtype='bool')
-        if change_sign:
-            mask[0] = True
-            mask[1:n_least_bits+1] = True
+
+##########################################################################
+class IntBitsNeighbor(MaskedBitsNeighbor):
+    '''
+    A neighborhood based on the change of a few bits in positions
+    defined by a mask.
+
+    This neighbor will be computed by randomly choosing a bit in the bitarray
+    representing the estimate and change a number of bits in the bitarray and
+    inverting their value. The bits that may be changed are selected by a
+    mask supplied by user.
+    '''
+    def __init__(self, mask=ones((8,), dtype='bool'), nb=2, nsign=2):
+        '''
+        Initializes the operator.
+
+        :Parameters:
+          mask
+            Binary array which specifies which bits may be changed.
+            The length of the argument to the __call__ method
+            must be  divisible by the length of the mask.
+          nb
+            The number of bits to be randomly choosen to be inverted
+            in the calculation of the neighbor. Be very careful while
+            choosing this parameter. While very large optimizations
+            can benefit from a big value here, it is not recommended
+            that more than one bit per variable is inverted at each
+            step -- otherwise, the neighbor might
+            fall very far from the present estimate, which can make the
+            algorithm not work accordingly. This defaults to 2, that is,
+            at each step, only one bit will be inverted at most.
+          nsign
+            The number of sign changes made when calculating a
+            neighbor. Sign change for integers consists of flipping
+            all the bits
+        '''
         super().__init__(mask=mask, nb=nb)
 
+        self.__nsign = nsign
+        self.__typelen = len(self.__bitmask)
+        self.__elem_offsets = None
 
-################################################################################
+    def _invert_sign(self, x):
+        """
+        Inverts the sign of self.__nsign integer data elements in the
+        input bitarray
+        """
+        xn = x[:]
+        # cache element offsets
+        if self.__elem_offsets is None:
+            self.__elem_offsets = arange(0, len(xn), len(self.__bitmask))
+
+        elem_offsets = numpy.random.choice(
+            self.__elem_offsets, self.__nsign)
+
+        # Invert sign of an integer
+        for offset in elem_offsets:
+            xn[offset:offset+self.__typelen-1] = ~xn[
+                offset:offset+self.__typelen-1]
+        return xn
+
+    def __call__(self, x):
+        '''
+        Computes the neighbor of the given estimate.
+
+        :Parameters:
+          x
+            The estimate to which the neighbor must be computed.
+            It is assumed that the estimate's length does not change
+            after the first call; otherwise, unspecified behaviour
+            will happen.
+        '''
+        x = self._flip_bits(x)
+        return self._invert_sign(x)
+
+
+##########################################################################
 if __name__ == "__main__":
     pass
