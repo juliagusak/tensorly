@@ -496,7 +496,7 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
     random_state : {None, int, np.random.RandomState}
     verbose : int, optional
         Level of verbosity
-    stop_criterion : {'rec_error_deviation', 'rec_error_decrease'}, optional
+    stop_criterion : {'rec_error_deviation', 'rec_error_decrease', 'both_error_decrease'}, optional
        Stopping criterion if `tol` is not None
        
     qmodes : list
@@ -521,8 +521,6 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
         Active when `qscheme` is not None.
         If dim is not None, along the dimension `dim` the values in the `tensor` are scaled and offset by a different value (effectively the scale and offset become vectors).
         If dim is None, all values in the `tensor` are scaled and offset by the same value.
-
-
     Returns
     -------
     factors : List of factors of the CP decomposition element `i` is of shape
@@ -538,9 +536,8 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
 
     .. [2] Tomasi, Giorgio, and Rasmus Bro. "PARAFAC and missing values."
             Chemometrics and Intelligent Laboratory Systems 75.2 (2005): 163-180.
-
-
     """
+    
     import torch
     tl.set_backend('pytorch')
 
@@ -557,7 +554,7 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                                  init = init, svd = svd,\
                                  random_state = random_state,
                                  normalize_factors=normalize_factors)
-    weights = tl.ones(rank, **tl.context(tensor))
+    weights = tl.ones( rank, **tl.context(tensor))
     
     ## Initialize quantized factors
     qfactors = copy.deepcopy(factors)
@@ -579,13 +576,12 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                 
             qfactors[i] = qfactor
 
-
     rec_errors = []
     qrec_errors = []
     norm_tensor = float(tl.norm(tensor, 2))
     
-    rec_error_flag = return_rec_errors or stop_criterion.startswith('rec')
-    qrec_error_flag = return_qrec_errors or stop_criterion.startswith('qrec')
+    rec_error_flag = return_rec_errors or stop_criterion.startswith('rec') or stop_criterion.startswith('both')
+    qrec_error_flag = return_qrec_errors or stop_criterion.startswith('qrec') or stop_criterion.startswith('both')
 
     if verbose:
         print("In parafac norm_tensor = {}".format(norm_tensor))
@@ -621,7 +617,8 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                             
                         pseudo_inverse = pseudo_inverse * tl.dot(
                             tl.transpose(factor), factor)
-                        
+                
+                
                 mttkrp = unfolding_dot_khatri_rao(tensor,\
                                                   (None, list(map(lambda i : qfactors[i] if qflag and (i in qi) else factors[i], range(ndim)))\
                                                   ), mode)
@@ -657,24 +654,36 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                         qfactors[mode] = qfactor
                     else:
                         qfactors[mode] = factor
-                    
-
+            
+            weights_prod = copy.deepcopy(weights)
+            qweights_prod = copy.deepcopy(weights)
+                        
+            if normalize_factors and qflag:
+                for i in range(len(factors)):
+                    if (i in qmodes):
+                        nrm = tl.norm(qfactors[i], order = 2, axis = 0)
+                        qweights_prod /= nrm
+                        if i in qi:
+                            weights_prod /= nrm
+            
             
             if rec_error_flag:
                 # ||tensor - rec||^2 = ||tensor||^2 + ||rec||^2 - 2*<tensor, rec>
-                factors_norm = kruskal_norm((weights, factors))
+#                 factors_norm = kruskal_norm((weights_prod,
+#                                             list(map(lambda i : qfactors[i] if qflag and (i in qi) else factors[i], range(ndim)))
+#                                             ))
 
                 # mttkrp and factor for the last mode. This is equivalent to the
                 # inner product <tensor, factorization>
-                iprod = tl.sum(tl.sum(mttkrp*factor, axis=0)*weights)
-                unnorml_rec_error = tl.sqrt(tl.abs(norm_tensor**2 + factors_norm**2 - 2*iprod))
+#                 iprod = tl.sum(tl.sum(mttkrp*factor, axis=0)*weights_prod)
+#                 unnorml_rec_error = tl.sqrt(tl.abs(norm_tensor**2 + factors_norm**2 - 2*iprod))
 
-#                 unnorml_rec_error = float(tl.norm(tensor - tl.kruskal_to_tensor((weights, factors)), 2))            
+                unnorml_rec_error = float(tl.norm(tensor - tl.kruskal_to_tensor((weights, factors)), 2))            
                 rec_error = unnorml_rec_error / norm_tensor
                 rec_errors.append(rec_error)
 
             if qrec_error_flag:
-                qunnorml_rec_error = float(tl.norm(tensor - tl.kruskal_to_tensor((weights, qfactors)), 2))
+                qunnorml_rec_error = float(tl.norm(tensor - tl.kruskal_to_tensor((qweights_prod, qfactors)), 2))
                 qrec_error = qunnorml_rec_error / norm_tensor
                 qrec_errors.append(qrec_error)
 
@@ -700,6 +709,10 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                         stop_flag = abs(qrec_error_decrease) < tol
                     elif stop_criterion == 'qrec_error_decrease':
                         stop_flag =  qrec_error_decrease < tol
+                    elif stop_criterion == 'both_error_deviation':
+                        stop_flag = (abs(rec_error_decrease) < tol) and (abs(qrec_error_decrease) < tol)
+                    elif stop_criterion == 'both_error_decrease':
+                        stop_flag =  (rec_error_decrease < tol) and (qrec_error_decrease < tol)
                     else:
                         raise TypeError("Unknown stop criterion")
 
@@ -716,7 +729,7 @@ def quantized_parafac(tensor, rank, n_iter_max, init,\
                             
                             
     kruskal_tensor = KruskalTensor((weights, factors))
-    qkruskal_tensor = KruskalTensor((weights, qfactors))
+    qkruskal_tensor = KruskalTensor((qweights_prod, qfactors))
                             
     if return_scale_zeropoint:
         return (kruskal_tensor, qkruskal_tensor), (tuple(rec_errors), tuple(qrec_errors)), tuple(factors_scale), tuple(factors_zeropoint)

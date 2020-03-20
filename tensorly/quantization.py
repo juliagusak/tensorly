@@ -2,55 +2,43 @@ import tensorly as tl
 from .base import unfold
 
 import torch
+import math
 
-def get_scale_denominator(dtype):
-    """Returns a number of intervals into which we divide
-    a range of valid values [min_value, max_malue] during quantization.
-    
-    Parameters
-    ----------
-    dtype : torch.dtype
-        Type to which we cast during quantization.
-    
-    Returns
-    -------
-    int
-        Number of quantization intervals.
-    """
-    
-    if dtype == torch.qint8:
-        scale_denom = 2**8 - 1  
-    elif dtype == torch.qint32:
-        scale_denom = 2**32 - 1
-    else:
-        raise TypeError("Can't perform quantization. Unknown quantization type: {}".format(dtype))
-        return
-    
-    return scale_denom
-
-
-def get_per_channel_stats(tensor, mode = 0):  
-    """Returns max, min and mean along last dimension for mode-`mode` unfolding
-    of `tensor` with modes starting at `0`.
+def get_tensor_stats(tensor, qscheme, mode = 0):  
+    """Returns max and min along last dimension for mode-`mode` unfolding
+    of `tensor` with modes starting at `0`, if qscheme is per channel.
+    If qscheme is per tensor,  returns max and min computed across all elements.
     
     Parameters
     ----------
     tensor : ndarray
+    qscheme : quantization scheme, default is ``torch.per_tensor_affine``
+        Has to be one of: ``torch.per_tensor_affine``, ``torch.per_tensor_symmetric``, ``torch.per_channel_affine``, ``torch.per_channel_symmetric``
     mode : int, default is 0
           Indexing starts at 0, therefore mode is in ``range(0, tensor.ndim)``.
 
     Returns
     -------
     tuple
-        max, min, mean of unfolded_tensor along last dimension.
+        max, min of unfolded_tensor along last dimension.
     """
-    unfolded_tensor = unfold(tensor, mode = mode)
+    if qscheme in [torch.per_channel_affine, torch.per_channel_symmetric]:
+        unfolded_tensor = unfold(tensor, mode = mode)
+
+        tmax = unfolded_tensor.max(dim = -1)[0]
+        tmin = unfolded_tensor.min(dim = -1)[0]
+        #tmean = unfolded_tensor.mean(dim = -1)
+        
+    elif qscheme in [torch.per_tensor_affine, torch.per_tensor_symmetric]:
+        tmax = tensor.max()
+        tmin = tensor.min()
+        
+    else:
+        raise TypeError("Can't collect statistics. Unknown quantization scheme: {}".format(qscheme))
+        return
+   
     
-    tmax = unfolded_tensor.max(dim = -1)[0]
-    tmin = unfolded_tensor.min(dim = -1)[0]
-    tmean = unfolded_tensor.mean(dim = -1)
-    
-    return tmax, tmin, tmean
+    return tmax, tmin
 
 
 def get_scale_zeropoint(tensor,\
@@ -80,37 +68,37 @@ def get_scale_zeropoint(tensor,\
         Offset in integer value that maps to float zero.
     """
     
-    scale_denom = get_scale_denominator(dtype)
-  
-    if qscheme in [torch.per_channel_affine, torch.per_channel_symmetric]:
+    #scale_denom = qmax - qmin, where qmax = 2**(nbits-1) - 1, qmin = 2**(nbits - 1)
+    if dtype == torch.qint8:
+        q = 2**7
+        scale_denom = 2*q - 1 
+    elif dtype == torch.qint32:
+        q = 2**31
+        scale_denom = 2*q - 1
+    else:
+        raise TypeError("Can't perform quantization. Unknown quantization type: {}".format(dtype))
+        return
+    
+    
+    tmax, tmin = get_tensor_stats(tensor, qscheme, mode = dim)
+    
+    if qscheme in [torch.per_channel_symmetric, torch.per_tensor_symmetric]:
+        scale = 2 * torch.where(tmin.abs() > tmax, tmin.abs(), tmax) / scale_denom
         
-        tmax, tmin, tmean = get_per_channel_stats(tensor, mode = dim)
-        
-        if qscheme == torch.per_channel_symmetric:
-            zero_point = tmean.round()
+        if dtype == torch.qint8:
+            zero_point = torch.zeros(scale.shape).int()
         else:
-            zero_point = tl.where(tmin < 0, tmin, tl.zeros(tmin.shape)).floor()
-            tmin = tl.where(tmin < zero_point, tmin, zero_point)
-            
-        zero_point = zero_point.int()    
-
-    elif qscheme in [torch.per_tensor_affine, torch.per_tensor_symmetric]:
-        tmax = tensor.max()
-        tmin = tensor.min() 
+            zero_point = (torch.zeros(scale.shape) + 128).int()
         
-        if qscheme == torch.per_tensor_symmetric:
-            zero_point = tensor.mean().round()
-        else:
-            zero_point = min(tmin, 0).floor().int()
-            tmin = min(tmin, zero_point)
-            
-        zero_point = zero_point.int()
+    elif qscheme in [torch.per_channel_affine, torch.per_tensor_affine]:
+        scale = (tmax - tmin) / scale_denom 
+        zero_point = (-q - (tmin / scale).int()).int()
         
+        zero_point = torch.clamp(zero_point, -q, q - 1)
     else:
         raise TypeError("Can't perform quantization. Unknown quantization scheme: {}".format(qscheme))
         return
 
-    scale = (tmax - tmin)/scale_denom 
     return scale, zero_point 
     
     
